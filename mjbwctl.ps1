@@ -271,6 +271,7 @@ function Invoke-DriverPhase {
     if ("$un" -eq '1') {
         Write-Info '  [驱动] 卸载开关已置位（unload=1），尝试卸载…'
         if (Stop-ZfProtect) { return 'stopped' }
+        Write-Info '  提示：若开关是本开机内刚置位的，驱动尚未带卸载回调——重启一次后再运行同命令完成阶段2。'
         return 'aborted'
     }
     Write-Info '  [驱动] 生产模式（无卸载回调）。实测：驱动在场时停服务被拒/杀进程被拒/改服务配置被拦。'
@@ -292,7 +293,7 @@ function Stop-ServiceVerified {
         Write-Info ("  [停止服务] {0} → 已停止" -f $Name)
         return $true
     }
-    if ($err -match 'Cannot open .* service on computer') {
+    if ($err -match '(?i)(Cannot open .* service on computer|无法打开计算机.+上的.+服务)') {
         Write-Info ("  [SCM拒绝] {0}：产品防篡改拦截 SCM 停止（驻留 services.exe，本开机内持续），将由清进程兜底" -f $Name)
         return $false
     }
@@ -310,7 +311,7 @@ function Start-ServiceVerified {
         Write-Info ("  [启动服务] {0} → 运行中" -f $Name)
         return $true
     }
-    if ($err -match 'Cannot open .* service on computer') {
+    if ($err -match '(?i)(Cannot open .* service on computer|无法打开计算机.+上的.+服务)') {
         Write-Info ("  [SCM拒绝] {0}：产品防篡改拦截 SCM 启动（驻留 services.exe，本开机内持续，重启后自愈）" -f $Name)
     } else {
         Write-Info ("  [启动失败] {0}：调用后仍为 {1}" -f $Name, $st)
@@ -391,7 +392,7 @@ function Invoke-StopSequence {
         Write-Info ("  [结束进程] {0} (pid={1})" -f $p.Name, $p.Id)
         $null = Stop-ProcessVerified -Id $p.Id -Name $p.Name
     }
-    Write-Info '── [3/3] 复查（防看门狗拉起，最多3轮×5秒）'
+    Write-Info '── [3/3] 复查（防看门狗拉起/驱动回拉，最多3轮×5秒）'
     for ($i = 1; $i -le 3; $i++) {
         Start-Sleep -Seconds 5
         $again = Get-TargetProcesses
@@ -409,13 +410,20 @@ function Invoke-StopSequence {
                 $null = Stop-ServiceVerified -Name $n
             }
         }
+        $drv = Get-Service -Name 'zfprotect' -ErrorAction SilentlyContinue
+        if ($drv -and $drv.Status -eq 'Running') {
+            $dirty = $true
+            Write-Info '  [复查-驱动] 驱动被拉回（看门狗竞态），再次卸载…'
+            $null = Stop-ZfProtect
+        }
         if (-not $dirty) { Write-Info ('  [复查] 第 {0} 轮：已无残留' -f $i); break }
     }
     $leftProc = @(Get-TargetProcesses)
     $leftSvc  = @(Get-TargetServices | Where-Object {
         ($Script:ManagedServices -contains $_.Name) -and $_.Name -ne 'zfprotect' -and $_.Name -ne 'super' -and $_.Status -eq 'Running' })
-    if ($leftProc.Count -eq 0 -and $leftSvc.Count -eq 0) { return $true }
-    Write-Info ("  [终态] 仍有 {0} 个服务运行 / {1} 个进程存活 → 退出未完成" -f $leftSvc.Count, $leftProc.Count)
+    $leftDrv = ((Get-Service -Name 'zfprotect' -ErrorAction SilentlyContinue).Status -eq 'Running')
+    if ($leftProc.Count -eq 0 -and $leftSvc.Count -eq 0 -and -not $leftDrv) { return $true }
+    Write-Info ("  [终态] 仍有 {0} 个服务运行 / {1} 个进程存活 / 驱动 {2} → 退出未完成" -f $leftSvc.Count, $leftProc.Count, $(if ($leftDrv) { 'Running' } else { 'Stopped' }))
     return $false
 }
 
@@ -794,7 +802,15 @@ function Show-Status {
         'restored' { Write-Info '运行模式：正常运行（曾退出过，已恢复）' }
         'scheduled' { Write-Info '运行模式：已预约下次开机自动执行退出（本次开机组件仍在运行）' }
         'onetime'  { Write-Info '运行模式：一次性退出中（下次开机自动恢复）' }
-        'armed'    { Write-Info '运行模式：退出开关已置位（unload=1），重启后运行 -ExitOneTime 完成阶段2' }
+        'armed'    {
+            $bk = Load-Backup
+            $boot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
+            if ($bk -and $bk.timestamp -and ([datetime]$bk.timestamp) -lt $boot) {
+                Write-Info '运行模式：退出开关已置位，且本开机驱动带卸载回调 → 直接运行 -ExitOneTime 完成阶段2（无需重启）'
+            } else {
+                Write-Info '运行模式：退出开关已置位（unload=1），重启后运行 -ExitOneTime 完成阶段2'
+            }
+        }
         'partial'  { Write-Info '运行模式：部分组件已停止（介于正常与退出之间）' }
     }
     if (Test-KeepOffTask) { Write-Info ("开机计划任务 {0}：存在" -f $Script:KeepOffTask) }
@@ -869,7 +885,7 @@ function Show-Menu {
             'restored' { Write-Host ' 当前：正常运行（已恢复）' }
             'scheduled' { Write-Host ' 当前：已预约下次开机自动退出（组件仍在运行）' -ForegroundColor Yellow }
             'onetime'  { Write-Host ' 当前：一次性退出中（下次开机自动恢复）' -ForegroundColor Yellow }
-            'armed'    { Write-Host ' 当前：退出开关已置位，重启后完成阶段2' -ForegroundColor Yellow }
+            'armed'    { Write-Host ' 当前：退出开关已置位，运行 -ExitOneTime 完成阶段2（本开机刚置位则需先重启）' -ForegroundColor Yellow }
             'partial'  { Write-Host ' 当前：部分组件已停止' -ForegroundColor Yellow }
         }
         Write-Host '-------------------------------------------------'

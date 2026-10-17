@@ -31,6 +31,8 @@
 
 **实测补充（2026-10-17 真机 Post 阶段）——services.exe 防篡改拦截**：产品把一层与驱动独立的防篡改挂钩驻留在 services.exe 进程内：本开机内对其 5 个用户服务的 SCM start/stop 一律拒绝（提升令牌同样；`sc.exe start` 报 `OpenService FAILED 5`、.NET 报 "Cannot open … service"；驱动已卸载、组件已杀后依然存活；System 日志无 7000/7009 → 请求未达 SCM 内部；`sc sdshow` 显示的默认 SDDL 与实际执行脱钩；无 LaunchProtected、无存储 Security 值）。重启后消失，开机自启不受影响。结论：① 退出相位「停服务」由清进程兜底完成（`[SCM拒绝]` 为预期路径）；② 同一开机内 `-Restore` 无法拉起这 5 个服务，「部分恢复」是平台约束下的正确终态——Start 已还原，重启一次即完全复原；③ KeepOff/ScheduleExit 开机任务运行时该挂钩从未植入，SCM 停止可用。
 
+**实测补充 2（2026-10-17 第二轮真机）——看门狗驱动回拉竞态**：驱动卸载、清进程完成后数秒内，产品组件可能未经 SCM 直接复活（本轮实测：zfhookupdat.exe + 4×zhp.exe），再经 SCM 重启 zfprotect 驱动——驱动服务不在防篡改拦截名单内，StartService 放行；重载的驱动重读 unload=1，仍带卸载回调、可再次卸载。竞态取决于维护节拍是否落进清理窗口（同日两轮真机：09:45 零复活、11:09 一轮复活）。v3.1 对策：① 复查循环每轮清复活进程/服务后核驱动，发现 Running 即自动再次卸载，下一轮复测；② 终态判定纳入驱动三态；③ SCM 拒绝签名双语识别（.NET 英文 "Cannot open … service on computer" 与本地化中文 "无法打开计算机…上的…服务"——同日两轮真机分别出现，旧匹配器只认英文导致中文报告掉进通用 [失败] 分支）。
+
 ## 3. 停止/启动顺序及其理由
 
 - **停止顺序**：`zfhookupdat → ZFICONTROL → zfnetchkclient → itxcltserver → ZFFTSSERVER → zfprotect(fltmc/sc) → 杀残留进程 → 3×5s 复查`
@@ -38,7 +40,7 @@
   - ZFICONTROL 先停：它是 ZFIUpdateServer→ZFIFileContent 的父进程
   - zfnetchkclient 先于 itxcltserver：前者 SCM 依赖后者，反序会被 SCM 拒绝
   - zfprotect 走 `Invoke-DriverPhase`：先读 `unload`，未置位则明确告知「需先写开关 + 重启」，置位后用 `fltmc unload` 与 `sc stop` 双保险并**验证真的停了**（不再假装成功）
-  - 复查 3 轮：防看门狗拉活；每轮都重新枚举并用新 PID 判定
+  - 复查 3 轮：防看门狗拉活；每轮都重新枚举并用新 PID 判定；每轮核驱动，被拉回即再次卸载（v3.1）
 - **恢复顺序**：`zfprotect → itxcltserver → zfnetchkclient → zfhookupdat → ZFICONTROL → ZFFTSSERVER`
   - 驱动先行；主客户端先于其依赖者
   - 仅启动备份时在运行的服务（`super` 原本停止 → 保持停止）
