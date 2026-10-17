@@ -4,7 +4,7 @@
 #  功能：
 #    -Status         查看当前状态（只读，无需管理员）
 #    -ExitOneTime    一次性安全退出（两阶段）：第1次运行置位驱动卸载开关(unload=1)并提示重启；
-#                    重启后再次运行完成卸载驱动+停止全部组件（不改启动类型，
+#                    重启后登录时自动弹出请求 UAC 完成阶段2并自动「检查并报告」（也可手动重跑；
 #                    再下次开机整套系统随开机自启自动恢复）
 #    -ExitKeepOff    持续退出：停止全部组件 + 禁用服务自启动 + 创建开机计划任务
 #                    MJBW_KeepOff，每次开机自动执行退出并保持退出
@@ -14,6 +14,7 @@
 #    -Restore        恢复正常运行：按 state_backup.json 还原服务启动类型并逐个启动
 #    -Interactive    中文菜单（双击 mjbwctl.cmd 进入）
 #    -Yes            跳过确认提示（计划任务/命令行自动化用）
+#    -BootFinish     开机自动完成（RunOnce 注册项调用）：自动确认 + 执行阶段2 + 自动「检查并报告」并驻窗
 #    -Plan           干跑：只打印将要执行的动作，不做任何修改（无需管理员）
 #    -ForceBackup    退出时强制重新快照现场（默认保护最早原始备份不覆盖）
 #
@@ -37,7 +38,8 @@ param(
     [switch]$Interactive,
     [switch]$Yes,
     [switch]$Plan,
-    [switch]$ForceBackup
+    [switch]$ForceBackup,
+    [switch]$BootFinish   # RunOnce 开机自动完成用：自动确认 + 自动「检查并报告」+ 驻窗
 )
 
 $ErrorActionPreference = 'Continue'
@@ -199,7 +201,7 @@ function Load-Backup {
 # ---------------- 确认 ----------------
 function Confirm-Action {
     param([string]$Title, [string]$Detail)
-    if ($Script:Yes) { return $true }
+    if ($Script:Yes -or $Script:BootFinish) { return $true }
     Write-Host ''
     Write-Host ('== ' + $Title) -ForegroundColor Yellow
     Write-Host $Detail
@@ -354,6 +356,26 @@ function Remove-KeepOffTask {
     }
 }
 
+# ---------------- 开机自动完成（ExitOneTime 阶段2：RunOnce + 登录 UAC 授权） ----------------
+$Script:AutoRunKey  = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce'
+$Script:AutoRunName = 'MJBW_ExitStage2'
+function Test-ExitAutoRun {
+    return [bool](Get-ItemProperty -Path $Script:AutoRunKey -Name $Script:AutoRunName -ErrorAction SilentlyContinue)
+}
+function New-ExitAutoRun {
+    try {
+        $cmd = ('powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{0}" -ExitOneTime -BootFinish' -f $PSCommandPath)
+        New-ItemProperty -Path $Script:AutoRunKey -Name $Script:AutoRunName -Value $cmd -PropertyType String -Force -ErrorAction Stop | Out-Null
+        return $true
+    } catch {
+        Write-Info ("  [失败] 注册「开机自动完成」（RunOnce）：{0}" -f $_.Exception.Message)
+        return $false
+    }
+}
+function Remove-ExitAutoRun {
+    Remove-ItemProperty -Path $Script:AutoRunKey -Name $Script:AutoRunName -ErrorAction SilentlyContinue
+}
+
 function Merge-BackupRuntimeItems {
     # KeepOff 专用：把"备份之后新出现"的计划任务/Run 键并入原始快照，
     # 保证 Restore 有据可还原；服务字段保持最早原始值不动。
@@ -476,7 +498,19 @@ function Invoke-Exit {
     if ($ph -eq 'armed') {
         Write-Info ''
         Write-Info '✔ 阶段 1/2 完成：卸载开关已置位（unload=1）。'
-        Write-Info ("  下一步：重启电脑 → 重新运行：{0} -ExitOneTime 完成阶段 2" -f $PSCommandPath)
+        if (-not $KeepOff) {
+            Remove-ExitAutoRun
+            if (New-ExitAutoRun) {
+                Write-Info '  下一步：重启电脑。'
+                Write-Info '  [OK] 已注册「开机自动完成」：重启后登录时将自动弹出窗口并请求 UAC 授权，'
+                Write-Info '       授权后自动执行阶段 2（卸载驱动 + 停止全部组件）并自动「检查并报告」。'
+                Write-Info '       （若未自动弹出：手动重新运行本命令即可，效果相同；-Restore 可撤销注册）'
+            } else {
+                Write-Info ("  下一步：重启电脑 → 重新运行：{0} -ExitOneTime 完成阶段 2" -f $PSCommandPath)
+            }
+        } else {
+            Write-Info '  下一步：重启电脑（开机任务将自动完成剩余退出并保持）'
+        }
         Write-Info '  说明：驱动生产模式无卸载回调，本会话内退出实测不可行；开关重启后才生效。'
         if ($KeepOff) {
             Write-Info '── 持续退出阶段1附加项（均为实测可行操作）'
@@ -499,6 +533,7 @@ function Invoke-Exit {
     # ph == 'stopped'：驱动已停止/未运行 → 阶段2，真实的退出
     Write-Info '── [阶段 2/2] 驱动已就绪（已停止），执行真实退出'
     $clear = Invoke-StopSequence
+    Remove-ExitAutoRun   # 阶段2已执行：清掉待触发的「开机自动完成」注册（如有）
     if ($KeepOff) {
         Write-Info '── 禁用受管服务自启动（Start → 4 Disabled）'
         foreach ($n in $Script:DisableOnKeepOff) {
@@ -730,6 +765,8 @@ function Invoke-Restore {
     }
     Remove-KeepOffTask
     Write-Info ("  [清理] 已删除计划任务 {0}（若存在）" -f $Script:KeepOffTask)
+    Remove-ExitAutoRun
+    Write-Info '  [清理] 已移除「开机自动完成」注册 MJBW_ExitStage2（若存在）'
     Write-Info '── [4/4] 核对表'
     $rows = @()
     foreach ($s in $b.services) {
@@ -815,6 +852,8 @@ function Show-Status {
     }
     if (Test-KeepOffTask) { Write-Info ("开机计划任务 {0}：存在" -f $Script:KeepOffTask) }
     else { Write-Info ("开机计划任务 {0}：不存在" -f $Script:KeepOffTask) }
+    if (Test-ExitAutoRun) { Write-Info '开机自动完成（RunOnce MJBW_ExitStage2）：已注册（重启登录后自动执行阶段2）' }
+    else { Write-Info '开机自动完成（RunOnce MJBW_ExitStage2）：未注册' }
     $un = Get-DriverSwitchValue 'unload'
     if ($null -eq $un) { Write-Info '驱动卸载开关 unload：缺省（生产模式，重启后驱动不可卸载）' }
     else { Write-Info ("驱动卸载开关 unload = {0}（1=重启后驱动带卸载回调，可用 -ExitOneTime 阶段2 卸载）" -f $un) }
@@ -847,8 +886,8 @@ function Show-Plan {
     if (-not $svc -and -not $procs) { Write-Info '  未发现密保卫士组件：任何修改动作都会被拒绝。'; return }
     if ($ExitOneTime) {
         Write-Info '── -ExitOneTime 将执行（两阶段）：'
-        Write-Info '   第1次运行：备份 + 驱动服务键写 unload=1（开关仅驱动重启后生效），提示重启；'
-        Write-Info '   重启后再次运行：fltmc/sc 卸载 zfprotect → 停止 5 个用户服务+super → 清理进程（此时均可行）→ 复查3轮；'
+        Write-Info '   第1次运行：备份 + 驱动服务键写 unload=1 + 注册 RunOnce「开机自动完成」，提示重启；'
+        Write-Info '   重启后登录时自动弹出请求 UAC → 自动完成：卸载驱动 → 停止 5 个用户服务+super → 清理进程 → 复查3轮 → 自动「检查并报告」；'
         Write-Info '   【不修改任何启动类型】→ 再下次开机整套系统自动恢复。'
     }
     if ($ExitKeepOff) {
@@ -865,11 +904,60 @@ function Show-Plan {
         if (-not $b) { Write-Info '── -Restore：没有备份文件，无动作。' }
         else {
             Write-Info ('── -Restore 将执行：按备份({0})还原各服务 Start（当前值即原值的跳过）→ 还原驱动开关面板（先于驱动启动）→ 按顺序启动 zfprotect→itxcltserver→zfnetchkclient→zfhookupdat→ZFICONTROL→ZFFTSSERVER →' -f $b.timestamp)
-            Write-Info '   还原计划任务/Run 启动项（如有）→ 补启 itxtray → 删除 MJBW_KeepOff → 输出核对表与诚实结论（被产品防篡改拦截的服务将如实标注 [SCM拒绝]，其 Start 值已还原，重启后随自启回归）。'
+            Write-Info '   还原计划任务/Run 启动项（如有）→ 补启 itxtray → 删除 MJBW_KeepOff → 移除「开机自动完成」注册（如有）→ 输出核对表与诚实结论（被产品防篡改拦截的服务将如实标注 [SCM拒绝]，其 Start 值已还原，重启后随自启回归）。'
         }
     }
     if (-not ($ExitOneTime -or $ExitKeepOff -or $ScheduleExit -or $Restore)) {
         Write-Info '（提示：-Plan 配合 -ExitOneTime / -ExitKeepOff / -ScheduleExit / -Restore 之一使用可查看该模式的具体动作清单）'
+    }
+}
+
+# ---------------- 检查并报告（终态核查与完成度判定） ----------------
+function Show-FinalCheck {
+    param([string]$Context = 'auto')
+    $st = Test-ExitSuccess
+    $un = Get-DriverSwitchValue 'unload'
+    $auto = Test-ExitAutoRun
+    $mode = Get-Mode
+    Write-Info '── [检查并报告] 终态核查'
+    $drvTxt = "$($st.Driver)"; if (-not $drvTxt) { $drvTxt = '未发现' }
+    $unTxt = '缺省（生产模式）'; if ("$un" -eq '1') { $unTxt = '1（置位：驱动重启后带卸载回调）' }
+    Write-Info ("  驱动 zfprotect：{0}" -f $drvTxt)
+    Write-Info ("  受管用户服务运行：{0} 个" -f $st.Svc)
+    Write-Info ("  目标进程：{0} 个" -f $st.Procs)
+    Write-Info ("  卸载开关 unload：{0}" -f $unTxt)
+    if ($auto) { Write-Info '  开机自动完成：已注册（重启登录后自动请求 UAC 完成阶段2）' }
+    else { Write-Info '  开机自动完成：未注册' }
+    Write-Info '── 判定与建议'
+    if ($Context -eq 'restore') {
+        Write-Info '  恢复完成度以上方「[4/4] 核对表」结论为准（✔=全部恢复；△=部分恢复：被拒服务重启一次即随自启回归）。'
+        return
+    }
+    switch ($mode) {
+        'normal'    { Write-Info '  ✔ 正常运行，保护在位，无需处理。' }
+        'restored'  { Write-Info '  ✔ 已恢复。若用户服务仍显示停止，重启一次即随自启完全回归。' }
+        'onetime'   {
+            if ($st.Procs -eq 0 -and $st.Svc -eq 0 -and "$($st.Driver)" -ne 'Running') {
+                Write-Info '  ✔ 一次性退出完成：本开机保持退出；下次开机整套系统自动恢复。'
+                Write-Info '    立即恢复：-Restore（或菜单 5）；闭环验证：恢复后重启运行 verify.cmd check。'
+            } else {
+                Write-Info ("  ✘ 退出未完成：驱动 {0} / 服务运行 {1} 个 / 进程 {2} 个。" -f $drvTxt, $st.Svc, $st.Procs)
+                Write-Info '    若组件已清但驱动被拉回：直接重新运行 -ExitOneTime 收尾（无需重启）；请留档 logs\ 供分析。'
+            }
+        }
+        'armed'     {
+            if ($st.Procs -eq 0 -and $st.Svc -eq 0 -and "$($st.Driver)" -eq 'Running') {
+                Write-Info '  ◐ 上次退出在阶段2中途停住（组件已清、驱动被拉回）：直接重新运行 -ExitOneTime 收尾，无需重启。'
+            } elseif ($auto) {
+                Write-Info '  ◐ 阶段1完成：重启电脑即可——登录时自动请求 UAC 完成阶段2并自动「检查并报告」。'
+            } else {
+                Write-Info '  ◐ 阶段1完成：重启电脑后重新运行 -ExitOneTime 完成阶段2。'
+            }
+            Write-Info '    （重启前反悔：-Restore 一键撤销并清除注册）'
+        }
+        'keepoff'   { Write-Info '  ✔ 持续退出中：开机任务每 boot 自动保持。恢复：-Restore（同时删除开机任务）。' }
+        'scheduled' { Write-Info '  ◐ 已预约：下次开机自动执行退出并保持。撤销：-Restore。' }
+        'partial'   { Write-Info '  ◐ 部分组件已停止：建议 -Status 查看明细后继续退出或 -Restore。' }
     }
 }
 
@@ -890,18 +978,20 @@ function Show-Menu {
         }
         Write-Host '-------------------------------------------------'
         Write-Host '  1) 查看详细状态'
-        Write-Host '  2) 一次性安全退出（两阶段：本次置开关→重启→再运行完成退出）'
-        Write-Host '  3) 持续退出（本次置开关+禁驱自启→重启后开机任务保持退出）'
+        Write-Host '  2) 一次性安全退出（引导式：置开关→重启后自动完成（UAC）→自动检查并报告）'
+        Write-Host '  3) 持续退出（置开关+禁驱自启→重启后开机任务自动保持退出）'
         Write-Host '  4) 预约下次开机自动执行退出（本次开机不动任何运行组件）'
-        Write-Host '  5) 恢复正常运行（按备份一键还原）'
+        Write-Host '  5) 恢复正常运行（按备份一键还原→自动检查并报告）'
+        Write-Host '  6) 检查并报告（终态核查与完成度判定）'
         Write-Host '  0) 退出程序'
         $c = Read-Host '请选择'
         switch ($c) {
             '1' { Show-Status }
-            '2' { Invoke-Exit -KeepOff $false }
-            '3' { Invoke-Exit -KeepOff $true }
-            '4' { Invoke-ScheduleExit }
-            '5' { Invoke-Restore }
+            '2' { Invoke-Exit -KeepOff $false; Show-FinalCheck }
+            '3' { Invoke-Exit -KeepOff $true; Show-FinalCheck }
+            '4' { Invoke-ScheduleExit; Show-FinalCheck }
+            '5' { Invoke-Restore; Show-FinalCheck -Context 'restore' }
+            '6' { Show-FinalCheck }
             '0' { }
             default { }
         }
@@ -934,6 +1024,9 @@ if (($needAdmin -contains $action) -and -not (Test-Admin)) {
 }
 
 Start-Log $action
+if ($Script:BootFinish -and $action -eq 'exit-once') {
+    Write-Info '═══ 开机自动完成：正在执行上次「一次性退出」预约的阶段 2 ═══'
+}
 switch ($action) {
     'status'      { Show-Status }
     'exit-once'   { Invoke-Exit -KeepOff $false }
@@ -942,4 +1035,9 @@ switch ($action) {
     'restore'     { Invoke-Restore }
     'reassert'    { Invoke-ReassertExit }
     'interactive' { Show-Menu }
+}
+if ($Script:BootFinish -and $action -eq 'exit-once') {
+    Show-FinalCheck
+    Write-Info ''
+    $null = Read-Host '开机自动完成已结束，按回车键关闭窗口...'
 }

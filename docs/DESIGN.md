@@ -33,6 +33,8 @@
 
 **实测补充 2（2026-10-17 第二轮真机）——看门狗驱动回拉竞态**：驱动卸载、清进程完成后数秒内，产品组件可能未经 SCM 直接复活（本轮实测：zfhookupdat.exe + 4×zhp.exe），再经 SCM 重启 zfprotect 驱动——驱动服务不在防篡改拦截名单内，StartService 放行；重载的驱动重读 unload=1，仍带卸载回调、可再次卸载。竞态取决于维护节拍是否落进清理窗口（同日两轮真机：09:45 零复活、11:09 一轮复活）。v3.1 对策：① 复查循环每轮清复活进程/服务后核驱动，发现 Running 即自动再次卸载，下一轮复测；② 终态判定纳入驱动三态；③ SCM 拒绝签名双语识别（.NET 英文 "Cannot open … service on computer" 与本地化中文 "无法打开计算机…上的…服务"——同日两轮真机分别出现，旧匹配器只认英文导致中文报告掉进通用 [失败] 分支）。
 
+**设计补充（v3.2 UE 迭代）——RunOnce「开机自动完成」+ 引导式菜单**：用户反馈两阶段退出需重启后手动重跑、体验差。对策：① `-ExitOneTime` 阶段1 arm 时向 `HKLM\…\RunOnce` 写入 `MJBW_ExitStage2`（值为本脚本 `-ExitOneTime -BootFinish` 命令行）——Windows 在下次登录时执行一次并自动删除；② `-BootFinish` 语义：自动确认（Confirm-Action 视同 -Yes）+ UAC 自提权（登录授权正是用户要求的交互点）+ 执行阶段2 + 自动「检查并报告」+ 驻窗（Read-Host 后关闭）；参数经 `$Script:ArgList` 重放穿透自提权无损。选择 RunOnce+登录+UAC 而非 SYSTEM ONSTART 任务：ExitOneTime 语义是"下次开机自动恢复"的一次性动作，不应残留计划任务，且用户明确要求 UAC 授权（SYSTEM 任务无交互）；KeepOff/ScheduleExit 的持久化保持需求仍由开机任务承担，分工不变。③ 生命周期：arm 注册 → 阶段2 完成 / -Restore 主动移除（均幂等）；用户拒绝 UAC 时 Windows 已消费该键，手动重跑兜底（驱动回调在场，免重启）。④ 新增 Show-FinalCheck「检查并报告」：驱动/服务/进程/开关/注册五项报数 + 模式机判定与建议（含"组件已清但驱动被拉回→直接重跑收尾"的中断态指引）；restore 上下文不复判退出完成度（以恢复核对表为准）。⑤ 菜单改引导式文案（1-6 项），2/3/4/5 执行完自动接「检查并报告」。
+
 ## 3. 停止/启动顺序及其理由
 
 - **停止顺序**：`zfhookupdat → ZFICONTROL → zfnetchkclient → itxcltserver → ZFFTSSERVER → zfprotect(fltmc/sc) → 杀残留进程 → 3×5s 复查`
